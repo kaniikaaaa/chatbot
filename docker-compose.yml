@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: chatbot
+      POSTGRES_PASSWORD: chatbot
+      POSTGRES_DB: chatbot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    environment:
+      DATABASE_URL: postgres://chatbot:chatbot@postgres:5432/chatbot
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    ports: ["8001:8001"]
+
+  chatbot-api:
+    build:
+      context: .
+      dockerfile: chatbot-api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://chatbot:chatbot@postgres:5432/chatbot
+      INGESTION_URL: http://ingestion:8001/v1/logs
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-openai}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-gpt-4o-mini}
+      PII_REDACT: ${PII_REDACT:-1}
+      CONTEXT_TURNS: ${CONTEXT_TURNS:-12}
+    depends_on:
+      postgres:  { condition: service_healthy }
+      ingestion: { condition: service_started }
+    ports: ["8000:8000"]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      CHATBOT_API_URL: http://chatbot-api:8000
+      INGESTION_URL: http://ingestion:8001
+    depends_on:
+      - chatbot-api
+      - ingestion
+    ports: ["3000:3000"]
+
+volumes:
+  pgdata:

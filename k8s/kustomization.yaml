@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: chatbot
+resources:
+  - namespace.yaml
+  - secrets.example.yaml
+  - postgres.yaml
+  - redis.yaml
+  - ingestion.yaml
+  - chatbot-api.yaml
+  - frontend.yaml
+  - ingress.yaml

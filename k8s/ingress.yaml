@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chatbot
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: chatbot.local
+      http:
+        paths:
+          - path: /api/chat
+            pathType: Prefix
+            backend: { service: { name: chatbot-api, port: { number: 8000 } } }
+          - path: /api/ingest
+            pathType: Prefix
+            backend: { service: { name: ingestion, port: { number: 8001 } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: frontend, port: { number: 3000 } } }
