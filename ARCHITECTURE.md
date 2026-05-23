@@ -1,71 +1,66 @@
 # Architecture Notes
 
-## Components
+## Ingestion Flow
 
-| Service        | Stack                  | Responsibility                                                                 |
-|----------------|------------------------|---------------------------------------------------------------------------------|
-| `frontend`     | Next.js 14, Tailwind   | Chat UI (stream, cancel, list, resume), dashboards, log viewer                  |
-| `chatbot-api`  | FastAPI, asyncpg       | Conversation/message CRUD, chat (SSE), context window, cancel signalling        |
-| `llm-sdk`      | Python pkg             | Provider adapters (OpenAI, Anthropic, Gemini), timing, PII redact, log shipper |
-| `ingestion`    | FastAPI, redis-py      | HTTP ingest, Redis Stream republish + consumer, Postgres writer, stats API     |
-| `postgres`     | Postgres 16            | Conversations, messages, inference_logs (JSONB metadata)                       |
-| `redis`        | Redis 7                | `llm.logs` stream / event bus + cross-replica signalling                       |
+1. UI sends a chat request to `chatbot-api` (via frontend proxy route with server-side auth injection).
+2. `chatbot-api` persists the user message and loads a short message window (`CONTEXT_TURNS`) for model context.
+3. `chatbot-api` calls `llm-sdk` with provider + model settings.
+4. `llm-sdk` captures inference metadata and pushes a `LogRecord` into a non-blocking async logger queue.
+5. Logger posts batches to ingestion `/v1/logs` using `INGESTION_WRITE_KEY`.
+6. `ingestion` validates payloads, normalizes fields, and upserts into `inference_logs` by `request_id`.
+7. `ingestion` also publishes the accepted record to Redis Stream `llm.logs` for downstream consumers.
+8. Dashboard/log endpoints read from Postgres and are exposed through frontend proxy routes.
 
-## Ingestion flow
+## Logging Strategy
 
-```
-  user → frontend → chatbot-api → llm-sdk → provider
-                                    │
-                                    ├── LogRecord enqueued
-                                    │
-                                    ▼ (async batch)
-                              POST /v1/logs
-                                    │
-                              ┌─────┴─────┐
-                              ▼           ▼
-                      Postgres writer   Redis Stream (XADD)
-                              │           │
-                              │           ▼
-                              │     other consumers
-                              ▼     (alerts, BI, …)
-                          inference_logs
-```
+- Log granularity: one record per provider invocation (`request_id` is unique idempotency key).
+- Captured metadata:
+  - provider/model
+  - started/completed timestamps
+  - latency + TTFT
+  - prompt/completion/total tokens (when available)
+  - status (`success`, `error`, `cancelled`)
+  - conversation/message IDs
+  - redacted input/output previews
+  - free-form metadata JSON
+- Reliability model:
+  - non-blocking queue on hot path (chat is not blocked by ingestion)
+  - bounded retries in logger before drop
+  - ingestion upsert avoids duplicate row amplification
+- Privacy model:
+  - PII redaction happens before preview persistence
+  - full prompt/response bodies are not stored in inference logs by default
 
-- The SDK enqueues `LogRecord` objects to an in-process `asyncio.Queue` and flushes them in micro-batches (every queue-drain cycle, max 100) to the ingestion endpoint with retry + backoff.
-- The ingestion service is dual-mode: each accepted record is (a) put on a writer queue that upserts into Postgres and (b) `XADD`-ed to the `llm.logs` Redis Stream with `MAXLEN ~ 100000` so subscribers can fan-out without re-querying the DB.
-- A consumer group `ingestion-workers` on the same stream lets you scale horizontally — adding replicas splits the partition automatically.
+## Scaling Considerations
 
-## Logging strategy
+- Stateless services:
+  - `frontend`, `chatbot-api`, and `ingestion` are horizontally scalable.
+- Deployment modes:
+  - Docker Compose runs Postgres/Redis/API/frontend as separate services.
+  - Render demo runs everything in one container with ephemeral Postgres/Redis for simpler review.
+- Current single-node assumptions:
+  - in-flight cancellation map is process-local in `chatbot-api`.
+- Recommended upgrades for multi-replica production:
+  - move cancellation signaling to Redis pub/sub or shared control channel
+  - add worker pool for ingestion writes when ingest throughput increases
+  - partition `inference_logs` by time for retention and query performance
+  - add read replicas/materialized rollups for dashboard-heavy workloads
+- Event architecture path:
+  - Redis Streams already emits events
+  - can evolve to consume-first architecture with durable consumer groups
 
-- **Non-blocking**: never let log shipping back-pressure the chat path. The SDK queue is bounded; overflow drops with a warning rather than blocking the model.
-- **Idempotent**: each log carries a `request_id`; the writer uses `INSERT … ON CONFLICT (request_id) DO UPDATE` so retries (or out-of-order completion updates from streaming) merge instead of duplicating.
-- **Forward-compatible**: a JSONB `metadata` column accepts arbitrary provider-specific fields without requiring schema migrations.
-- **Privacy-aware**: previews capped at 500 chars and run through a regex PII pass before persistence (configurable with `PII_REDACT`).
+## Failure Handling Assumptions
 
-## Scaling considerations
-
-- All services are stateless (chatbot-api keeps only short-lived `asyncio.Event`s for in-flight stream cancels; that signalling moves to Redis pub/sub for multi-replica deployments).
-- Postgres is the only stateful tier. The hot table (`inference_logs`) can be range-partitioned on `started_at` (monthly) once it exceeds ~10M rows.
-- For very high QPS, the synchronous HTTP ingest can be bypassed: the SDK writes directly to Redis Stream, ingestion only consumes (single write path, lower fan-out cost).
-- Dashboards query pre-aggregated views (`/v1/stats` returns `percentile_disc` over a date_trunc'd window) so the UI scales with retention, not call volume.
-
-## Failure handling assumptions
-
-| Failure                  | Behaviour                                                                                  |
-|--------------------------|--------------------------------------------------------------------------------------------|
-| Provider API down/error  | `status='error'` + exception in `error_message`; UI receives `error` SSE event              |
-| Ingestion service down   | SDK retries 3× with exponential backoff, then drops batch and warns; chat path continues   |
-| Postgres down            | Writer task surfaces error → record dropped; Redis Stream retains entries (capped) for fan-out |
-| Redis down               | HTTP ingest still writes to Postgres; event-bus republish fails and is logged              |
-| User cancels mid-stream  | Event flagged → SDK closes provider stream, log written with `status='cancelled'`, partial output preview retained |
-| Chatbot-api crash mid-stream | The conversation's assistant message is whatever was committed; the in-flight log row is upserted with the partial state once the SDK retries |
-
-## Frontend behaviours
-
-- **Cancel a conversation**: `POST /v1/conversations/{id}/cancel` flips status and signals the in-flight stream via an `AbortController` + an in-memory event on the API.
-- **List conversations**: `GET /v1/conversations`, ordered by `updated_at DESC`.
-- **Resume a conversation**: clicking a conversation loads its full message history (`/messages`); new messages append, and a `cancelled` conversation auto-flips to `active` on the next user turn.
-
-## k8s
-
-`k8s/` contains a Kustomize-style flat layout (one Deployment + Service per app, one StatefulSet for Postgres, one Deployment for Redis, and an Ingress that fronts the frontend / chatbot-api / ingestion). Apply with `kubectl apply -k k8s/`.
+- Provider/API failures:
+  - Non-streaming requests return `502`.
+  - Streaming requests emit SSE `error`.
+  - Failure still emits an inference log with `status='error'`.
+- Ingestion failures:
+  - Do not fail user chat response path.
+  - Log records may be dropped after retry exhaustion (known tradeoff in lightweight mode).
+- Redis failures:
+  - Do not block core ingestion into Postgres.
+  - Only event fan-out is degraded.
+- Database failures:
+  - Chat persistence or ingestion writes fail fast with explicit API errors.
+  - No distributed transaction guarantees between chat write and ingestion write in this version.

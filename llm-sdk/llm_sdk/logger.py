@@ -1,12 +1,8 @@
-"""Fire-and-forget log shipper. Buffers records in an asyncio.Queue and
-flushes them to the ingestion endpoint on a background task so the
-inference call path never blocks on network I/O to the logger."""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -39,24 +35,17 @@ class LogRecord:
 
 
 class InferenceLogger:
-    def __init__(
-        self,
-        endpoint: str | None = None,
-        flush_interval: float = 0.25,
-        max_queue: int = 10_000,
-    ) -> None:
-        self.endpoint = endpoint or os.getenv(
-            "INGESTION_URL", "http://ingestion:8001/v1/logs"
-        )
+    def __init__(self, endpoint: str | None = None, max_queue: int = 10_000) -> None:
+        self.endpoint = endpoint or os.getenv("INGESTION_URL", "http://ingestion:8001/v1/logs")
+        self.write_key = os.getenv("INGESTION_WRITE_KEY", "")
         self._queue: asyncio.Queue[LogRecord] = asyncio.Queue(maxsize=max_queue)
-        self._flush_interval = flush_interval
         self._task: asyncio.Task[None] | None = None
         self._client: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
-            self._client = httpx.AsyncClient(timeout=5.0)
-            self._task = asyncio.create_task(self._run(), name="llm-sdk-flusher")
+            self._client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+            self._task = asyncio.create_task(self._run(), name="inference-log-flusher")
 
     async def stop(self) -> None:
         if self._task:
@@ -72,19 +61,17 @@ class InferenceLogger:
         try:
             self._queue.put_nowait(record)
         except asyncio.QueueFull:
-            log.warning("inference log queue full — dropping record %s", record.request_id)
+            log.warning("dropping inference log because queue is full: %s", record.request_id)
 
     async def _run(self) -> None:
         assert self._client is not None
         while True:
             try:
-                batch: list[LogRecord] = [await self._queue.get()]
-                # Drain whatever else is queued without waiting.
+                batch = [await self._queue.get()]
                 while not self._queue.empty() and len(batch) < 100:
                     batch.append(self._queue.get_nowait())
                 await self._flush(batch)
             except asyncio.CancelledError:
-                # Final drain on shutdown.
                 rest: list[LogRecord] = []
                 while not self._queue.empty():
                     rest.append(self._queue.get_nowait())
@@ -92,24 +79,20 @@ class InferenceLogger:
                     await self._flush(rest)
                 raise
             except Exception:
-                log.exception("flusher loop crashed; sleeping before retry")
-                await asyncio.sleep(1.0)
+                log.exception("log flusher crashed")
+                await asyncio.sleep(1)
 
     async def _flush(self, batch: list[LogRecord]) -> None:
         assert self._client is not None
-        payload = {"logs": [asdict(r) for r in batch]}
+        headers = {"X-Ingestion-Key": self.write_key} if self.write_key else {}
+        payload = {"logs": [asdict(item) for item in batch]}
         for attempt in range(3):
             try:
-                resp = await self._client.post(self.endpoint, json=payload)
-                if resp.status_code < 400:
+                response = await self._client.post(self.endpoint, json=payload, headers=headers)
+                if response.status_code < 400:
                     return
-                log.warning("ingestion %s on attempt %d: %s",
-                            resp.status_code, attempt + 1, resp.text[:200])
+                log.warning("ingestion returned %s: %s", response.status_code, response.text[:200])
             except httpx.HTTPError as exc:
-                log.warning("ingestion network error attempt %d: %s", attempt + 1, exc)
-            await asyncio.sleep(0.2 * (2 ** attempt))
+                log.warning("ingestion network error on attempt %d: %s", attempt + 1, exc)
+            await asyncio.sleep(0.2 * (2**attempt))
         log.error("dropped %d inference logs after retries", len(batch))
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)

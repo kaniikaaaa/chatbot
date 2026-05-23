@@ -1,12 +1,21 @@
 "use client";
 
 import { Fragment, useEffect, useState } from "react";
+import { SideNav } from "@/components/layout/side-nav";
 
 type Log = {
-  request_id: string; provider: string; model: string; status: string;
-  latency_ms: number | null; ttft_ms: number | null;
-  prompt_tokens: number | null; completion_tokens: number | null; total_tokens: number | null;
-  error_message: string | null; input_preview: string | null; output_preview: string | null;
+  request_id: string;
+  provider: string;
+  model: string;
+  status: string;
+  latency_ms: number | null;
+  ttft_ms: number | null;
+  total_tokens: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  error_message: string | null;
+  input_preview: string | null;
+  output_preview: string | null;
   started_at: string;
 };
 
@@ -15,77 +24,57 @@ export default function Logs() {
   const [open, setOpen] = useState<string | null>(null);
 
   useEffect(() => {
-    const tick = async () => {
-      const r = await fetch("/api/ingest/v1/logs?limit=100");
-      setLogs(await r.json());
-    };
-    tick();
-    const id = setInterval(tick, 4000);
+    async function load() {
+      const response = await fetch("/api/ingestion/v1/logs?limit=100", { cache: "no-store" });
+      setLogs(await response.json());
+    }
+    void load();
+    const id = setInterval(load, 4000);
     return () => clearInterval(id);
   }, []);
 
   return (
-    <div className="space-y-4">
-      <h1 className="text-xl font-semibold">Recent inference logs</h1>
-      <div className="rounded-2xl bg-ink-900/70 border border-ink-800 overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="text-left text-zinc-500">
-            <tr>
-              <th className="px-4 py-2">When</th><th>Provider</th><th>Model</th>
-              <th>Status</th><th>Latency</th><th>TTFT</th><th>Tokens</th><th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {logs.map(l => (
-              <Fragment key={l.request_id}>
-                <tr className="border-t border-ink-800 hover:bg-ink-800/40">
-                  <td className="px-4 py-2 text-zinc-400">{new Date(l.started_at).toLocaleTimeString()}</td>
-                  <td>{l.provider}</td>
-                  <td className="font-mono text-xs">{l.model}</td>
-                  <td>
-                    <span className={"inline-block px-1.5 py-0.5 rounded text-xs " +
-                      (l.status === "success" ? "bg-emerald-500/20 text-emerald-300" :
-                       l.status === "cancelled" ? "bg-amber-500/20 text-amber-300" :
-                       "bg-red-500/20 text-red-300")}>{l.status}</span>
-                  </td>
-                  <td>{l.latency_ms ?? "-"} ms</td>
-                  <td>{l.ttft_ms ?? "-"} ms</td>
-                  <td>{l.total_tokens ?? "-"}</td>
-                  <td>
-                    <button onClick={() => setOpen(open === l.request_id ? null : l.request_id)}
-                      className="text-xs text-accent-soft hover:underline">{open === l.request_id ? "hide" : "view"}</button>
-                  </td>
-                </tr>
-                {open === l.request_id && (
-                  <tr className="bg-ink-950/60">
-                    <td colSpan={8} className="px-4 py-3">
-                      <div className="grid grid-cols-2 gap-4 text-xs">
-                        <div>
-                          <div className="text-zinc-500 mb-1">Input preview</div>
-                          <pre className="whitespace-pre-wrap font-mono text-zinc-300">{l.input_preview || "(empty)"}</pre>
-                        </div>
-                        <div>
-                          <div className="text-zinc-500 mb-1">Output preview</div>
-                          <pre className="whitespace-pre-wrap font-mono text-zinc-300">{l.output_preview || "(empty)"}</pre>
-                        </div>
-                        {l.error_message && (
-                          <div className="col-span-2">
-                            <div className="text-zinc-500 mb-1">Error</div>
-                            <pre className="whitespace-pre-wrap text-red-300">{l.error_message}</pre>
-                          </div>
-                        )}
-                        <div className="col-span-2 text-zinc-500">
-                          request_id <span className="font-mono">{l.request_id}</span> · prompt {l.prompt_tokens ?? "?"} / completion {l.completion_tokens ?? "?"}
-                        </div>
-                      </div>
-                    </td>
+    <main className="app-shell">
+      <aside className="border-r bg-gray-50">
+        <SideNav />
+      </aside>
+      <section className="min-h-0 overflow-auto bg-gray-50 p-5">
+        <h1 className="mb-5 text-xl font-semibold">Inference Logs</h1>
+        <div className="overflow-hidden rounded-lg border bg-white">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-left text-gray-500">
+              <tr><th className="p-3">When</th><th>Provider</th><th>Model</th><th>Status</th><th>Latency</th><th>TTFT</th><th>Tokens</th><th></th></tr>
+            </thead>
+            <tbody>
+              {logs.map((log) => (
+                <Fragment key={log.request_id}>
+                  <tr className="border-t">
+                    <td className="p-3">{new Date(log.started_at).toLocaleTimeString()}</td>
+                    <td>{log.provider}</td>
+                    <td className="font-mono text-xs">{log.model}</td>
+                    <td>{log.status}</td>
+                    <td>{log.latency_ms ?? "-"} ms</td>
+                    <td>{log.ttft_ms ?? "-"} ms</td>
+                    <td>{log.total_tokens ?? "-"}</td>
+                    <td><button className="text-blue-600" onClick={() => setOpen(open === log.request_id ? null : log.request_id)}>{open === log.request_id ? "hide" : "view"}</button></td>
                   </tr>
-                )}
-              </Fragment>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
+                  {open === log.request_id ? (
+                    <tr className="border-t bg-gray-50">
+                      <td className="p-3" colSpan={8}>
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <pre className="whitespace-pre-wrap rounded bg-white p-3 text-xs">{log.input_preview || "(empty)"}</pre>
+                          <pre className="whitespace-pre-wrap rounded bg-white p-3 text-xs">{log.output_preview || "(empty)"}</pre>
+                          {log.error_message ? <pre className="whitespace-pre-wrap rounded bg-red-50 p-3 text-xs text-red-700 md:col-span-2">{log.error_message}</pre> : null}
+                        </div>
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
   );
 }

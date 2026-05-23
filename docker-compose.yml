@@ -22,7 +22,7 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
       timeout: 3s
-      retries: 10
+      retries: 20
 
   ingestion:
     build:
@@ -31,9 +31,13 @@ services:
     environment:
       DATABASE_URL: postgres://chatbot:chatbot@postgres:5432/chatbot
       REDIS_URL: redis://redis:6379
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN}
+      INGESTION_WRITE_KEY: ${INGESTION_WRITE_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      ENABLE_STREAM_CONSUMER: ${ENABLE_STREAM_CONSUMER:-0}
     depends_on:
       postgres: { condition: service_healthy }
-      redis:    { condition: service_healthy }
+      redis: { condition: service_healthy }
     ports: ["8001:8001"]
 
   chatbot-api:
@@ -48,10 +52,13 @@ services:
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-openai}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-gpt-4o-mini}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN}
+      INGESTION_WRITE_KEY: ${INGESTION_WRITE_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
       PII_REDACT: ${PII_REDACT:-1}
       CONTEXT_TURNS: ${CONTEXT_TURNS:-12}
     depends_on:
-      postgres:  { condition: service_healthy }
+      postgres: { condition: service_healthy }
       ingestion: { condition: service_started }
     ports: ["8000:8000"]
 
@@ -62,6 +69,7 @@ services:
     environment:
       CHATBOT_API_URL: http://chatbot-api:8000
       INGESTION_URL: http://ingestion:8001
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN}
     depends_on:
       - chatbot-api
       - ingestion

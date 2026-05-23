@@ -4,10 +4,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.pytest_cache/
 .venv/
 venv/
 node_modules/
 .next/
+test-results/
 out/
 dist/
 build/

@@ -4,7 +4,7 @@ services:
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile.render
-    healthCheckPath: /
+    healthCheckPath: /api/chat/healthz
     envVars:
       - key: OPENAI_API_KEY
         sync: false
@@ -25,7 +25,11 @@ services:
       - key: DATABASE_URL
         value: postgres://chatbot:chatbot@127.0.0.1:5432/chatbot
       - key: REDIS_URL
-        value: redis://127.0.0.1:6379
+        value: unix:///tmp/render-redis.sock
+      - key: PORT
+        value: "3000"
+      - key: HOSTNAME
+        value: 0.0.0.0
       - key: DEFAULT_PROVIDER
         value: openai
       - key: DEFAULT_MODEL

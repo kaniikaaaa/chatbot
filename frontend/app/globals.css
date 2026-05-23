@@ -1,16 +1,38 @@
+@import "@assistant-ui/react-ui/styles/index.css";
+@import "@assistant-ui/react-ui/styles/markdown.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-html, body { height: 100%; }
+html,
 body {
-  background: radial-gradient(circle at 20% 0%, #1a1530 0%, #0a0a0c 40%) fixed;
-  color: #e6e6ea;
+  height: 100%;
 }
 
-.scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
-.scrollbar-thin::-webkit-scrollbar-thumb { background: #2a2a32; border-radius: 6px; }
-.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+body {
+  background: #ffffff;
+  color: #111827;
+  overflow: hidden;
+}
 
-.fade-in { animation: fade 200ms ease-out; }
-@keyframes fade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+.app-shell {
+  display: grid;
+  height: 100dvh;
+  grid-template-columns: 18rem minmax(0, 1fr);
+}
+
+.thread-panel {
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    height: 100dvh;
+    grid-template-columns: 1fr;
+  }
+
+  .thread-panel {
+    min-height: 0;
+  }
+}

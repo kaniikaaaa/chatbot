@@ -1,26 +1,23 @@
-"""Provider-agnostic chat client. Each provider's SDK is imported lazily
-so the package doesn't fail to import when only one is configured.
-
-Streaming yields plain text chunks; the SDK fills in token counts and
-latency once the stream closes."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
 from typing import AsyncIterator
 
-from .logger import InferenceLogger, LogRecord, now_ms
-from .pii import redact
+import httpx
 
+from .logger import InferenceLogger, LogRecord
+from .pii import redact
 
 PREVIEW_CHARS = 500
 
 
 class LLMClient:
     def __init__(self, logger: InferenceLogger, redact_pii: bool = True) -> None:
-        self._logger = logger
-        self._redact = redact_pii
+        self.logger = logger
+        self.redact_pii = redact_pii
 
     async def chat(
         self,
@@ -28,12 +25,13 @@ class LLMClient:
         provider: str,
         model: str,
         messages: list[dict[str, str]],
-        stream: bool = False,
-        conversation_id: str | None = None,
-        message_id: str | None = None,
+        stream: bool,
+        conversation_id: str,
+        message_id: str,
         request_id: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 1024,
+        cancel_event: asyncio.Event | None = None,
     ):
         rid = request_id or str(uuid.uuid4())
         record = LogRecord(
@@ -47,94 +45,93 @@ class LLMClient:
             streamed=stream,
             metadata={"temperature": temperature, "max_tokens": max_tokens},
         )
-
-        prompt_text = "\n".join(m.get("content", "") for m in messages)
-        redacted_prompt, prompt_hit = (redact(prompt_text) if self._redact else (prompt_text, False))
-        record.input_preview = (redacted_prompt or "")[:PREVIEW_CHARS]
-        record.pii_redacted = prompt_hit
+        input_text = "\n".join(item.get("content", "") for item in messages)
+        safe_input, input_hit = redact(input_text) if self.redact_pii else (input_text, False)
+        record.input_preview = (safe_input or "")[:PREVIEW_CHARS]
+        record.pii_redacted = input_hit
 
         if stream:
-            return self._chat_stream(provider, model, messages, temperature, max_tokens, record)
-        return await self._chat_once(provider, model, messages, temperature, max_tokens, record)
+            return self._stream(provider, model, messages, temperature, max_tokens, record, cancel_event)
+        return await self._once(provider, model, messages, temperature, max_tokens, record)
 
-    async def _chat_once(self, provider, model, messages, temperature, max_tokens, record):
-        t0 = time.monotonic()
+    async def _once(self, provider, model, messages, temperature, max_tokens, record):
+        started = time.monotonic()
         try:
-            text, usage = await _PROVIDERS[provider].complete(
-                model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
+            text, usage = await PROVIDERS[provider].complete(
+                model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
             )
-            record.latency_ms = int((time.monotonic() - t0) * 1000)
+            record.latency_ms = int((time.monotonic() - started) * 1000)
             record.completed_at = time.time()
             record.prompt_tokens = usage.get("prompt_tokens")
             record.completion_tokens = usage.get("completion_tokens")
             record.total_tokens = usage.get("total_tokens")
-            redacted_out, out_hit = (redact(text) if self._redact else (text, False))
-            record.output_preview = (redacted_out or "")[:PREVIEW_CHARS]
-            record.pii_redacted = record.pii_redacted or out_hit
+            safe_output, output_hit = redact(text) if self.redact_pii else (text, False)
+            record.output_preview = (safe_output or "")[:PREVIEW_CHARS]
+            record.pii_redacted = record.pii_redacted or output_hit
             return text, record
         except Exception as exc:
             record.status = "error"
             record.error_message = f"{type(exc).__name__}: {exc}"
-            record.latency_ms = int((time.monotonic() - t0) * 1000)
+            record.latency_ms = int((time.monotonic() - started) * 1000)
             record.completed_at = time.time()
             raise
         finally:
-            self._logger.log(record)
+            self.logger.log(record)
 
-    async def _chat_stream(self, provider, model, messages, temperature, max_tokens, record) -> AsyncIterator[str]:
-        t0 = time.monotonic()
+    async def _stream(self, provider, model, messages, temperature, max_tokens, record, cancel_event):
+        started = time.monotonic()
         first_token_at: float | None = None
         chunks: list[str] = []
         try:
-            async for chunk in _PROVIDERS[provider].stream(
-                model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
+            async for chunk in PROVIDERS[provider].stream(
+                model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
             ):
+                if cancel_event and cancel_event.is_set():
+                    record.status = "cancelled"
+                    break
                 if first_token_at is None:
                     first_token_at = time.monotonic()
-                    record.ttft_ms = int((first_token_at - t0) * 1000)
+                    record.ttft_ms = int((first_token_at - started) * 1000)
                 chunks.append(chunk)
                 yield chunk
-            record.latency_ms = int((time.monotonic() - t0) * 1000)
-            record.completed_at = time.time()
+            if cancel_event and cancel_event.is_set():
+                record.status = "cancelled"
             text = "".join(chunks)
-            # Best-effort token count using a single approximation
-            # (avoids per-provider tokenizer drift in the hot path).
+            record.latency_ms = int((time.monotonic() - started) * 1000)
+            record.completed_at = time.time()
             record.completion_tokens = max(1, len(text) // 4) if text else 0
-            redacted_out, out_hit = (redact(text) if self._redact else (text, False))
-            record.output_preview = (redacted_out or "")[:PREVIEW_CHARS]
-            record.pii_redacted = record.pii_redacted or out_hit
+            safe_output, output_hit = redact(text) if self.redact_pii else (text, False)
+            record.output_preview = (safe_output or "")[:PREVIEW_CHARS]
+            record.pii_redacted = record.pii_redacted or output_hit
         except Exception as exc:
             record.status = "error"
             record.error_message = f"{type(exc).__name__}: {exc}"
-            record.latency_ms = int((time.monotonic() - t0) * 1000)
+            record.latency_ms = int((time.monotonic() - started) * 1000)
             record.completed_at = time.time()
             raise
         finally:
-            self._logger.log(record)
+            self.logger.log(record)
 
 
-# --- Provider adapters --------------------------------------------------------
-
-class _OpenAI:
-    name = "openai"
-
+class OpenAIProvider:
     def _client(self):
         from openai import AsyncOpenAI
-        return AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        return AsyncOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            http_client=httpx.AsyncClient(timeout=30.0, trust_env=False),
+        )
 
     async def complete(self, *, model, messages, temperature, max_tokens):
-        client = self._client()
-        resp = await client.chat.completions.create(
-            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
+        response = await self._client().chat.completions.create(
+            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
         )
-        usage = resp.usage.model_dump() if resp.usage else {}
-        return resp.choices[0].message.content or "", usage
+        usage = response.usage.model_dump() if response.usage else {}
+        return response.choices[0].message.content or "", usage
 
     async def stream(self, *, model, messages, temperature, max_tokens):
-        client = self._client()
-        stream = await client.chat.completions.create(
-            model=model, messages=messages, temperature=temperature,
-            max_tokens=max_tokens, stream=True,
+        stream = await self._client().chat.completions.create(
+            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens, stream=True
         )
         async for event in stream:
             delta = event.choices[0].delta.content if event.choices else None
@@ -142,94 +139,86 @@ class _OpenAI:
                 yield delta
 
 
-class _Anthropic:
-    name = "anthropic"
-
+class AnthropicProvider:
     def _client(self):
         from anthropic import AsyncAnthropic
+
         return AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     def _split(self, messages):
-        system = next((m["content"] for m in messages if m["role"] == "system"), None)
-        rest = [m for m in messages if m["role"] != "system"]
+        system = next((item["content"] for item in messages if item["role"] == "system"), "")
+        rest = [item for item in messages if item["role"] != "system"]
         return system, rest
 
     async def complete(self, *, model, messages, temperature, max_tokens):
-        client = self._client()
         system, rest = self._split(messages)
-        resp = await client.messages.create(
-            model=model, messages=rest, system=system or "",
-            temperature=temperature, max_tokens=max_tokens,
+        response = await self._client().messages.create(
+            model=model, messages=rest, system=system, temperature=temperature, max_tokens=max_tokens
         )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
         usage = {
-            "prompt_tokens": resp.usage.input_tokens,
-            "completion_tokens": resp.usage.output_tokens,
-            "total_tokens": resp.usage.input_tokens + resp.usage.output_tokens,
+            "prompt_tokens": response.usage.input_tokens,
+            "completion_tokens": response.usage.output_tokens,
+            "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
         }
         return text, usage
 
     async def stream(self, *, model, messages, temperature, max_tokens):
-        client = self._client()
         system, rest = self._split(messages)
-        async with client.messages.stream(
-            model=model, messages=rest, system=system or "",
-            temperature=temperature, max_tokens=max_tokens,
-        ) as s:
-            async for text in s.text_stream:
+        async with self._client().messages.stream(
+            model=model, messages=rest, system=system, temperature=temperature, max_tokens=max_tokens
+        ) as stream:
+            async for text in stream.text_stream:
                 yield text
 
 
-class _Gemini:
-    name = "gemini"
-
+class GeminiProvider:
     def _client(self, model):
         import google.generativeai as genai
+
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
         return genai.GenerativeModel(model)
 
     def _convert(self, messages):
-        # Gemini does not have a system role; flatten it into the first user turn.
-        sys_text = " ".join(m["content"] for m in messages if m["role"] == "system")
-        out = []
-        for m in messages:
-            if m["role"] == "system":
+        system = " ".join(item["content"] for item in messages if item["role"] == "system")
+        output = []
+        for item in messages:
+            if item["role"] == "system":
                 continue
-            role = "user" if m["role"] == "user" else "model"
-            text = m["content"]
-            if sys_text and role == "user" and not out:
-                text = f"{sys_text}\n\n{text}"
-            out.append({"role": role, "parts": [text]})
-        return out
+            role = "user" if item["role"] == "user" else "model"
+            text = item["content"]
+            if system and not output and role == "user":
+                text = f"{system}\n\n{text}"
+            output.append({"role": role, "parts": [text]})
+        return output
 
     async def complete(self, *, model, messages, temperature, max_tokens):
-        m = self._client(model)
-        resp = await m.generate_content_async(
+        response = await self._client(model).generate_content_async(
             self._convert(messages),
             generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
         )
-        text = resp.text or ""
         usage = {}
-        try:
+        if getattr(response, "usage_metadata", None):
             usage = {
-                "prompt_tokens": resp.usage_metadata.prompt_token_count,
-                "completion_tokens": resp.usage_metadata.candidates_token_count,
-                "total_tokens": resp.usage_metadata.total_token_count,
+                "prompt_tokens": response.usage_metadata.prompt_token_count,
+                "completion_tokens": response.usage_metadata.candidates_token_count,
+                "total_tokens": response.usage_metadata.total_token_count,
             }
-        except AttributeError:
-            pass
-        return text, usage
+        return response.text or "", usage
 
     async def stream(self, *, model, messages, temperature, max_tokens):
-        m = self._client(model)
-        resp = await m.generate_content_async(
+        response = await self._client(model).generate_content_async(
             self._convert(messages),
             generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
             stream=True,
         )
-        async for chunk in resp:
+        async for chunk in response:
             if chunk.text:
                 yield chunk.text
 
 
-_PROVIDERS = {p.name: p() for p in (_OpenAI, _Anthropic, _Gemini)}
+PROVIDERS = {
+    "openai": OpenAIProvider(),
+    "anthropic": AnthropicProvider(),
+    "gemini": GeminiProvider(),
+}

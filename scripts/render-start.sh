@@ -4,7 +4,7 @@ set -euo pipefail
 export API_AUTH_TOKEN="${API_AUTH_TOKEN:-render-demo-token}"
 export INGESTION_WRITE_KEY="${INGESTION_WRITE_KEY:-render-ingestion-key}"
 export DATABASE_URL="${DATABASE_URL:-postgres://chatbot:chatbot@127.0.0.1:5432/chatbot}"
-export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
+export REDIS_URL="${REDIS_URL:-unix:///tmp/render-redis.sock}"
 export CHATBOT_API_URL="${CHATBOT_API_URL:-http://127.0.0.1:8000}"
 export INGESTION_API_URL="${INGESTION_API_URL:-http://127.0.0.1:8001}"
 export INGESTION_URL="${INGESTION_URL:-http://127.0.0.1:8001/v1/logs}"
@@ -18,6 +18,30 @@ export CONTEXT_TURNS="${CONTEXT_TURNS:-12}"
 
 PGDATA="${PGDATA:-/tmp/render-postgres}"
 export PGDATA
+
+cd /app/frontend
+node server.js &
+WEB_PID=$!
+cd /app
+
+cleanup() {
+  kill "$WEB_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+for attempt in $(seq 1 30); do
+  if ! kill -0 "$WEB_PID" 2>/dev/null; then
+    wait "$WEB_PID"
+  fi
+  if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null; then
+    break
+  fi
+  if [ "$attempt" -eq 30 ]; then
+    echo "web server did not bind to ${HOSTNAME}:${PORT}" >&2
+    exit 1
+  fi
+  sleep 1
+done
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   mkdir -p "$PGDATA"
@@ -34,10 +58,10 @@ else
   su postgres -c "/usr/lib/postgresql/*/bin/pg_ctl -D '$PGDATA' -o \"-c listen_addresses='127.0.0.1'\" -w start"
 fi
 
-redis-server --save "" --appendonly no --daemonize yes
+rm -f /tmp/render-redis.sock
+redis-server --port 0 --unixsocket /tmp/render-redis.sock --unixsocketperm 777 --save "" --appendonly no --daemonize yes
 
 uvicorn main:app --app-dir /app/ingestion --host 127.0.0.1 --port 8001 &
 uvicorn main:app --app-dir /app/chatbot-api --host 127.0.0.1 --port 8000 &
 
-cd /app/frontend
-exec node server.js
+wait "$WEB_PID"
