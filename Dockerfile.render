@@ -1,0 +1,49 @@
+FROM node:20-bookworm AS frontend-deps
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+FROM node:20-bookworm AS frontend-builder
+WORKDIR /app
+COPY --from=frontend-deps /app/node_modules ./node_modules
+COPY frontend/ ./
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+FROM node:20-bookworm AS runner
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PATH=/opt/venv/bin:$PATH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        postgresql \
+        postgresql-client \
+        python3 \
+        python3-pip \
+        python3-venv \
+        redis-server \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY chatbot-api/requirements.txt /tmp/chatbot-requirements.txt
+COPY ingestion/requirements.txt /tmp/ingestion-requirements.txt
+COPY llm-sdk /app/llm-sdk
+RUN python3 -m venv /opt/venv \
+    && pip install --no-cache-dir -r /tmp/chatbot-requirements.txt -r /tmp/ingestion-requirements.txt /app/llm-sdk
+
+COPY chatbot-api /app/chatbot-api
+COPY ingestion /app/ingestion
+COPY db /app/db
+COPY --from=frontend-builder /app/.next/standalone /app/frontend
+COPY --from=frontend-builder /app/.next/static /app/frontend/.next/static
+COPY scripts/render-start.sh /app/render-start.sh
+RUN chmod +x /app/render-start.sh
+
+EXPOSE 3000
+CMD ["/app/render-start.sh"]

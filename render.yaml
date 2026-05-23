@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: inference-logger-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.render
+    healthCheckPath: /
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: API_AUTH_TOKEN
+        generateValue: true
+      - key: INGESTION_WRITE_KEY
+        generateValue: true
+      - key: CHATBOT_API_URL
+        value: http://127.0.0.1:8000
+      - key: INGESTION_API_URL
+        value: http://127.0.0.1:8001
+      - key: INGESTION_URL
+        value: http://127.0.0.1:8001/v1/logs
+      - key: DATABASE_URL
+        value: postgres://chatbot:chatbot@127.0.0.1:5432/chatbot
+      - key: REDIS_URL
+        value: redis://127.0.0.1:6379
+      - key: DEFAULT_PROVIDER
+        value: openai
+      - key: DEFAULT_MODEL
+        value: gpt-4o-mini
+      - key: PII_REDACT
+        value: "1"
+      - key: CONTEXT_TURNS
+        value: "12"
+      - key: ENABLE_STREAM_CONSUMER
+        value: "0"
